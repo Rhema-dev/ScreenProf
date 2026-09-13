@@ -45,6 +45,7 @@
       "output": "release"
     },
     "win": {
+      "icon": "public/screenprof-icon.png",
       "target": "nsis"
     },
     "nsis": {

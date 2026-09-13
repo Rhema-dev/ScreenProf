@@ -2,7 +2,7 @@ import type { BootstrapData, CaptureSource, TutorPlan, TutorStep } from './types
 
 export const mockBootstrap: BootstrapData = {
   platform: 'browser-preview',
-  settings: { visionPaused: false, historyEnabled: true, model: 'gemini-3.6-flash' },
+  settings: { visionPaused: false, historyEnabled: true },
   sessions: [],
 };
 
@@ -24,8 +24,10 @@ export const mockStep: TutorStep = {
 };
 
 export const mockPlan: TutorPlan = {
+  responseType: 'guide',
   title: 'Create a chart in Excel',
   summary: 'Use the Insert tab to choose a chart, then adjust its title and layout.',
+  sections: [],
   confidence: 0.94,
   completed: false,
   steps: [

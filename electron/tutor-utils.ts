@@ -21,10 +21,6 @@ export function normalizedToPixels(target: TargetBounds, width: number, height: 
   };
 }
 
-export function migrateGeminiModel(model: string) {
-  return model === 'gemini-2.5-flash' ? 'gemini-3.6-flash' : model;
-}
-
 export function extractInteractionText(response: any): string {
   const fromSteps = response?.steps
     ?.filter((step: any) => step?.type === 'model_output')
@@ -33,4 +29,23 @@ export function extractInteractionText(response: any): string {
     .map((content: any) => content.text || '')
     .join('');
   return fromSteps || response?.output_text || '';
+}
+
+export function rateLimitCooldownMs(retryAfter: string | null, responseBody: string, now = Date.now()) {
+  let delayMs = 0;
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    delayMs = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - now;
+  }
+  if (!(delayMs > 0)) {
+    try {
+      const details = JSON.parse(responseBody)?.error?.details;
+      const retryDelay = Array.isArray(details)
+        ? details.find((detail: any) => typeof detail?.retryDelay === 'string')?.retryDelay
+        : undefined;
+      const match = typeof retryDelay === 'string' ? retryDelay.match(/^(\d+(?:\.\d+)?)s$/) : null;
+      if (match) delayMs = Number(match[1]) * 1000;
+    } catch { /* use the default cooldown */ }
+  }
+  return Math.max(1000, Math.min(delayMs > 0 ? delayMs : 60_000, 15 * 60_000));
 }

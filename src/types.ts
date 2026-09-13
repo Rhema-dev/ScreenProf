@@ -10,9 +10,17 @@ export interface TutorStep {
   needsClarification: boolean;
   clarification: string | null;
 }
+export type ResponseType = 'guide' | 'explanation' | 'troubleshooting';
+export interface ResponseSection {
+  title: string;
+  content: string;
+  points: string[];
+}
 export interface TutorPlan {
+  responseType: ResponseType;
   title: string;
   summary: string;
+  sections: ResponseSection[];
   steps: TutorStep[];
   confidence: number;
   completed: boolean;
@@ -40,7 +48,6 @@ export interface CaptureResult {
 export interface PublicSettings {
   visionPaused: boolean;
   historyEnabled: boolean;
-  model: string;
 }
 export interface SessionMessage {
   id: string;
@@ -71,7 +78,7 @@ export interface ScreenProfBridge {
   capture(sourceId: string): Promise<CaptureResult>;
   askTutor(payload: { question: string; sourceId: string; sessionId?: string; previousPlan?: TutorPlan; issue?: string; currentStepIndex?: number }): Promise<{ plan: TutorPlan; sessionId: string | null; capture: CaptureResult; sessions: TutorSession[] }>;
   explainStep(payload: { question: string; sourceId: string; step: TutorStep; ancestry?: string[]; issue?: string }): Promise<NestedExplanation>;
-  updateSettings(update: { visionPaused?: boolean; historyEnabled?: boolean; model?: string }): Promise<PublicSettings>;
+  updateSettings(update: { visionPaused?: boolean; historyEnabled?: boolean }): Promise<PublicSettings>;
   clearHistory(): Promise<TutorSession[]>;
   hideOverlay(): Promise<void>;
   showOverlay(step: TutorStep): Promise<void>;

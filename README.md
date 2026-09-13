@@ -10,14 +10,14 @@ ScreenProf is a privacy-first Windows desktop AI tutor. It captures a screen or 
 - Global `Ctrl + Space` shortcut and system tray controls
 - Explicit screen/window source selection
 - Event-driven screen capture (no continuous recording)
-- Reduced capture payloads, minimal Gemini thinking, transient retry handling, and a 90-second network deadline
-- Gemini 3.6 Flash multimodal analysis through the Interactions API with structured JSON output
-- Complete tutorial plans generated in one request, with instant local step completion
+- Reduced capture payloads, high Gemini thinking, transient retry handling, and a 90-second network deadline
+- Gemini 3.8 Flash multimodal analysis with 3.5/3.1 Flash-Lite rate-limit fallbacks
+- Request-aware explanations, guides, and troubleshooting responses generated in one request
 - Per-step issue reporting that rechecks the screen and rewrites the remaining plan
 - Fully recursive “Explain further” threads whose micro-steps can be completed, highlighted, reported, and expanded again without leaving the main guide
 - Persistent New session control that safely resets the workspace while retaining previous guides in History
 - Transparent, click-through overlay window
-- Encrypted API-key storage through the operating system
+- Gemini API requests isolated to the Electron main process
 - Local conversation history and instant vision pause
 - Browser preview mode and coordinate-safety unit tests
 - Windows installer configuration

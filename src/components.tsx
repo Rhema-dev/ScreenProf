@@ -2,15 +2,7 @@ import type { ReactNode } from 'react';
 import { ChevronsDown, X } from 'lucide-react';
 
 export function BrandMark({ small = false }: { small?: boolean }) {
-  return (
-    <svg className={small ? 'brand-mark small' : 'brand-mark'} viewBox="0 0 48 48" aria-hidden="true">
-      <path d="M8 5.5h32a5 5 0 0 1 5 5v23a5 5 0 0 1-5 5H25.8L16 45l1.9-6.5H8a5 5 0 0 1-5-5v-23a5 5 0 0 1 5-5Z" fill="currentColor" />
-      <path d="m11.5 20.1 12.7-6.8 12.7 6.8-12.7 6.8-12.7-6.8Z" fill="#fff" />
-      <path d="M16.7 23.1v5.1c0 2.2 3.4 4 7.5 4s7.5-1.8 7.5-4v-5.1l-7.5 4-7.5-4Z" fill="#fff" opacity=".92" />
-      <path d="M36.9 20.2v7.2" fill="none" stroke="#fff" strokeWidth="2.3" strokeLinecap="round" />
-      <circle cx="36.9" cy="29.4" r="2" fill="#fff" />
-    </svg>
-  );
+  return <img className={small ? 'brand-mark small' : 'brand-mark'} src="./screenprof-icon.png" alt="" aria-hidden="true" />;
 }
 
 export function WindowBar({ onCollapse }: { onCollapse: () => void }) {

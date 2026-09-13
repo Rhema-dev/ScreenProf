@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clampTarget, extractInteractionText, migrateGeminiModel, normalizedToPixels } from './tutor-utils';
+import { clampTarget, extractInteractionText, normalizedToPixels, rateLimitCooldownMs } from './tutor-utils';
 
 describe('tutor coordinate safety', () => {
   it('clamps model coordinates to the normalized screenshot', () => {
@@ -29,11 +29,6 @@ describe('tutor coordinate safety', () => {
     });
   });
 
-  it('migrates the retired default without overriding custom models', () => {
-    expect(migrateGeminiModel('gemini-2.5-flash')).toBe('gemini-3.6-flash');
-    expect(migrateGeminiModel('gemini-3.8-flash')).toBe('gemini-3.8-flash');
-  });
-
   it('reads structured text from an Interactions API response', () => {
     expect(extractInteractionText({
       status: 'completed',
@@ -42,5 +37,13 @@ describe('tutor coordinate safety', () => {
         { type: 'model_output', content: [{ type: 'text', text: '{"title":"Next step"}' }] },
       ],
     })).toBe('{"title":"Next step"}');
+  });
+
+  it('honors Gemini rate-limit cooldown hints', () => {
+    expect(rateLimitCooldownMs('12', '')).toBe(12_000);
+    expect(rateLimitCooldownMs(null, JSON.stringify({
+      error: { details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '2.5s' }] },
+    }))).toBe(2500);
+    expect(rateLimitCooldownMs(null, '')).toBe(60_000);
   });
 });

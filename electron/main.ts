@@ -16,6 +16,8 @@ import crypto from 'node:crypto';
 import type {
   CaptureResult,
   NestedExplanation,
+  ResponseSection,
+  ResponseType,
   SessionMessage,
   StoredSettings,
   TargetBounds,
@@ -23,7 +25,7 @@ import type {
   TutorSession,
   TutorStep,
 } from './types';
-import { clampTarget, extractInteractionText, migrateGeminiModel, normalizedToPixels } from './tutor-utils';
+import { clampTarget, extractInteractionText, normalizedToPixels, rateLimitCooldownMs } from './tutor-utils';
 
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 let mainWindow: BrowserWindow | null = null;
@@ -36,12 +38,14 @@ let lastCapture: CaptureResult | null = null;
 const ORB_SIZE = 76;
 const PANEL_WIDTH = 440;
 const PANEL_HEIGHT = 780;
-const BUNDLED_GEMINI_API_KEY = 'AQ.Ab8RN6JLUC_N9kOJIV4dHTIS44nGvzhoTWna6l7AygLPPtrPoA';
+const BUNDLED_GEMINI_API_KEY = "AQ.Ab8RN6IRJNQbePmioaa9KCmhErCZpDE8kEnhi6b6fbPmMgXrag";
+const PRIMARY_GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').replace(/[^a-zA-Z0-9._-]/g, '') || 'gemini-3.8-flash';
+const GEMINI_MODELS = [...new Set([PRIMARY_GEMINI_MODEL, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'])];
+const modelCooldowns = new Map<string, number>();
 
 const defaultSettings: StoredSettings = {
   visionPaused: false,
   historyEnabled: true,
-  model: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
 };
 
 function dataPath(file: string) {
@@ -62,10 +66,11 @@ function writeJson(file: string, value: unknown) {
 }
 
 function getSettings(): StoredSettings {
-  const settings = { ...defaultSettings, ...readJson<StoredSettings>('settings.json', defaultSettings) };
-  // Transparently move installations created before Gemini 2.5 Flash was retired.
-  settings.model = migrateGeminiModel(settings.model);
-  return settings;
+  const stored = readJson<Partial<StoredSettings>>('settings.json', defaultSettings);
+  return {
+    visionPaused: typeof stored.visionPaused === 'boolean' ? stored.visionPaused : defaultSettings.visionPaused,
+    historyEnabled: typeof stored.historyEnabled === 'boolean' ? stored.historyEnabled : defaultSettings.historyEnabled,
+  };
 }
 
 function publicSettings() {
@@ -73,7 +78,6 @@ function publicSettings() {
   return {
     visionPaused: settings.visionPaused,
     historyEnabled: settings.historyEnabled,
-    model: settings.model,
   };
 }
 
@@ -103,6 +107,12 @@ function loadApp(win: BrowserWindow, query?: Record<string, string>) {
   return win.loadFile(path.join(__dirname, '../dist/index.html'), { query });
 }
 
+function appIconPath() {
+  return isDev
+    ? path.join(app.getAppPath(), 'public', 'screenprof-icon.png')
+    : path.join(__dirname, '../dist/screenprof-icon.png');
+}
+
 function createMainWindow() {
   const workArea = screen.getPrimaryDisplay().workArea;
   mainWindow = new BrowserWindow({
@@ -114,8 +124,10 @@ function createMainWindow() {
     frame: false,
     transparent: true,
     resizable: false,
+    movable: true,
     alwaysOnTop: true,
     skipTaskbar: true,
+    icon: appIconPath(),
     backgroundColor: '#00000000',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -172,8 +184,7 @@ function createOverlayWindow() {
 }
 
 function trayIcon() {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48"><path d="M8 5.5h32a5 5 0 0 1 5 5v23a5 5 0 0 1-5 5H25.8L16 45l1.9-6.5H8a5 5 0 0 1-5-5v-23a5 5 0 0 1 5-5Z" fill="#e85f43"/><path d="m11.5 20.1 12.7-6.8 12.7 6.8-12.7 6.8-12.7-6.8Z" fill="white"/><path d="M16.7 23.1v5.1c0 2.2 3.4 4 7.5 4s7.5-1.8 7.5-4v-5.1l-7.5 4-7.5-4Z" fill="white" opacity=".92"/><path d="M36.9 20.2v7.2" fill="none" stroke="white" stroke-width="2.3" stroke-linecap="round"/><circle cx="36.9" cy="29.4" r="2" fill="white"/></svg>`;
-  return nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`).resize({ width: 16, height: 16 });
+  return nativeImage.createFromPath(appIconPath()).resize({ width: 16, height: 16 });
 }
 
 function createTray() {
@@ -237,6 +248,7 @@ function collapseMainWindow() {
   const y = fit(current.y, area.y, area.y + area.height - ORB_SIZE);
   mainWindow.setMinimumSize(1, 1);
   mainWindow.setResizable(false);
+  mainWindow.setMovable(true);
   mainWindow.setBounds({ x, y, width: ORB_SIZE, height: ORB_SIZE }, true);
   mainWindow.setSkipTaskbar(true);
   collapsed = true;
@@ -317,19 +329,46 @@ const tutorStepSchema = {
 const tutorPlanSchema = {
   type: 'object',
   properties: {
+    responseType: {
+      type: 'string',
+      enum: ['guide', 'explanation', 'troubleshooting'],
+      description: 'The presentation style that best matches the user request.',
+    },
     title: { type: 'string', description: 'A short title for the complete tutorial.' },
-    summary: { type: 'string', description: 'One sentence describing the overall approach.' },
+    summary: { type: 'string', description: 'A concise direct answer or description of the overall approach.' },
+    sections: {
+      type: 'array',
+      description: 'Explanatory or diagnostic sections. Use an empty array for a straightforward guide.',
+      minItems: 0,
+      maxItems: 6,
+      items: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'A short section heading.' },
+          content: { type: 'string', description: 'A concise paragraph written for the user.' },
+          points: {
+            type: 'array',
+            minItems: 0,
+            maxItems: 6,
+            items: { type: 'string' },
+            description: 'Optional supporting facts, observations, or cautions.',
+          },
+        },
+        required: ['title', 'content', 'points'],
+        additionalProperties: false,
+      },
+    },
     steps: {
       type: 'array',
-      description: 'The complete ordered procedure from the current screen to the finished goal.',
-      minItems: 1,
+      description: 'Ordered user actions for guides and troubleshooting. Use an empty array for explanations.',
+      minItems: 0,
       maxItems: 12,
       items: tutorStepSchema,
     },
     confidence: { type: 'number', minimum: 0, maximum: 1 },
     completed: { type: 'boolean' },
   },
-  required: ['title', 'summary', 'steps', 'confidence', 'completed'],
+  required: ['responseType', 'title', 'summary', 'sections', 'steps', 'confidence', 'completed'],
   additionalProperties: false,
 };
 
@@ -365,13 +404,35 @@ function validateStep(value: any): TutorStep {
   };
 }
 
+function validateSection(value: any): ResponseSection {
+  return {
+    title: String(value?.title || 'What this means').slice(0, 120),
+    content: String(value?.content || '').slice(0, 2400),
+    points: Array.isArray(value?.points)
+      ? value.points.slice(0, 6).map((point: unknown) => String(point).slice(0, 600))
+      : [],
+  };
+}
+
 function validatePlan(value: any): TutorPlan {
-  if (!value || typeof value !== 'object' || !Array.isArray(value.steps) || value.steps.length === 0) {
+  if (!value || typeof value !== 'object' || !Array.isArray(value.steps) || !Array.isArray(value.sections)) {
     throw new Error('Gemini returned an invalid tutorial plan.');
   }
+  const responseType: ResponseType = ['guide', 'explanation', 'troubleshooting'].includes(value.responseType)
+    ? value.responseType
+    : 'guide';
+  if (responseType !== 'explanation' && value.steps.length === 0) {
+    throw new Error('Gemini returned a guide without any steps.');
+  }
+  const sections = value.sections.slice(0, 6).map(validateSection);
+  if (responseType === 'explanation' && sections.length === 0) {
+    sections.push(validateSection({ title: 'Explanation', content: value.summary, points: [] }));
+  }
   return {
+    responseType,
     title: String(value.title || 'Your guide').slice(0, 120),
     summary: String(value.summary || '').slice(0, 1000),
+    sections,
     steps: value.steps.slice(0, 12).map(validateStep),
     confidence: Math.max(0, Math.min(1, Number(value.confidence) || 0)),
     completed: Boolean(value.completed),
@@ -389,84 +450,117 @@ function validateExplanation(value: any): NestedExplanation {
   };
 }
 
-async function requestStructured(apiKey: string, model: string, prompt: string, imageData: string, schema: unknown, maxOutputTokens: number) {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 90_000);
-    try {
-      const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-        signal: controller.signal,
-        body: JSON.stringify({
-          model,
-          store: false,
-          input: [
-            { type: 'text', text: prompt },
-            { type: 'image', mime_type: 'image/jpeg', data: imageData },
-          ],
-          generation_config: {
-            thinking_level: 'minimal',
-            max_output_tokens: maxOutputTokens,
-          },
-          response_format: {
-            type: 'text',
-            mime_type: 'application/json',
-            schema,
-          },
-        }),
-      });
-      if (!response.ok) {
-        const raw = await response.text();
-        let message = `Gemini request failed (${response.status}).`;
-        try { message = JSON.parse(raw)?.error?.message || message; } catch { /* keep safe message */ }
-        if (attempt === 0 && (response.status === 429 || response.status >= 500)) {
+async function requestStructured(apiKey: string, prompt: string, imageData: string, schema: unknown) {
+  let sawRateLimit = false;
+  for (const model of GEMINI_MODELS) {
+    if ((modelCooldowns.get(model) || 0) > Date.now()) {
+      sawRateLimit = true;
+      continue;
+    }
+
+    let rateLimited = false;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 90_000);
+      try {
+        const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+          signal: controller.signal,
+          body: JSON.stringify({
+            model,
+            store: false,
+            input: [
+              { type: 'text', text: prompt },
+              { type: 'image', mime_type: 'image/jpeg', data: imageData },
+            ],
+            generation_config: {
+              thinking_level: 'high',
+            },
+            response_format: {
+              type: 'text',
+              mime_type: 'application/json',
+              schema,
+            },
+          }),
+        });
+        if (!response.ok) {
+          const raw = await response.text();
+          if (response.status === 429) {
+            modelCooldowns.set(model, Date.now() + rateLimitCooldownMs(response.headers.get('retry-after'), raw));
+            sawRateLimit = true;
+            rateLimited = true;
+            break;
+          }
+          let message = `Gemini request failed (${response.status}).`;
+          try { message = JSON.parse(raw)?.error?.message || message; } catch { /* keep safe message */ }
+          if (attempt === 0 && response.status >= 500) {
+            await new Promise((resolve) => setTimeout(resolve, 900));
+            continue;
+          }
+          throw new Error(message.slice(0, 500));
+        }
+        modelCooldowns.delete(model);
+        const json = await response.json() as any;
+        if (json?.status === 'incomplete') {
+          if (attempt === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 900));
+            continue;
+          }
+          throw new Error('Gemini stopped before finishing the tutorial. Please try again.');
+        }
+        if (json?.status === 'failed' || json?.status === 'cancelled') {
+          throw new Error('Gemini could not complete the tutorial request. Please try again.');
+        }
+        const text = extractInteractionText(json);
+        if (!text) throw new Error('Gemini returned an empty response.');
+        try {
+          return JSON.parse(text);
+        } catch (error) {
+          if (attempt === 0 && error instanceof SyntaxError) {
+            await new Promise((resolve) => setTimeout(resolve, 900));
+            continue;
+          }
+          throw new Error('Gemini returned incomplete structured data. Please try again.');
+        }
+      } catch (error) {
+        if ((error as Error).name === 'AbortError') {
+          throw new Error('Gemini did not respond within 90 seconds. Check your connection or try a smaller window capture.');
+        }
+        if (attempt === 0 && error instanceof TypeError) {
           await new Promise((resolve) => setTimeout(resolve, 900));
           continue;
         }
-        throw new Error(message.slice(0, 500));
+        throw error;
+      } finally {
+        clearTimeout(timeout);
       }
-      const json = await response.json() as any;
-      const text = extractInteractionText(json);
-      if (!text) throw new Error('Gemini returned an empty response.');
-      return JSON.parse(text);
-    } catch (error) {
-      if ((error as Error).name === 'AbortError') {
-        throw new Error('Gemini did not respond within 90 seconds. Check your connection or try a smaller window capture.');
-      }
-      if (attempt === 0 && error instanceof TypeError) {
-        await new Promise((resolve) => setTimeout(resolve, 900));
-        continue;
-      }
-      throw error;
-    } finally {
-      clearTimeout(timeout);
     }
+    if (rateLimited) continue;
   }
+  if (sawRateLimit) throw new Error('Gemini is busy right now. Please try again shortly.');
   throw new Error('Unable to reach Gemini after two attempts.');
 }
 
 async function askGemini(question: string, capture: CaptureResult, previousPlan?: TutorPlan, issue?: string, currentStepIndex?: number): Promise<TutorPlan> {
   const apiKey = getApiKey();
   if (!apiKey) throw new Error('ScreenProf is not configured for live screen guidance.');
-  const model = getSettings().model.replace(/[^a-zA-Z0-9._-]/g, '');
   const imageData = capture.dataUrl.split(',')[1];
   const revisionContext = previousPlan
     ? `\nExisting plan: ${JSON.stringify(previousPlan)}\nThe user reported a problem at step ${(currentStepIndex ?? 0) + 1}: ${String(issue || 'The step did not work').slice(0, 1000)}\nRewrite the complete plan to fit the newly visible screen. Preserve already completed steps at the beginning and revise the current and remaining steps.`
     : '';
-  const prompt = `You are ScreenProf, a careful desktop software tutor.\n\nUser goal: ${question}\nVisible source: ${capture.sourceName}${revisionContext}\n\nCreate the complete ordered tutorial now, from the current state through completion. Do not make the user wait for a separate AI request after every step.\n\nRules:\n- Return every step needed for the whole task, up to 12 concise steps.\n- Each step must contain exactly one user action.\n- Only claim a control is currently visible when supported by the screenshot.\n- Coordinates use the screenshot itself, normalized from 0 to 1000.\n- Supply target coordinates only for a control visible on this screenshot; use null for controls that appear on later screens.\n- If the goal is already complete, set completed true.\n- If a step is uncertain, say what the user should look for and use a null target instead of inventing UI.\n- Do not request or expose passwords, financial data, authentication codes, API keys, or other secrets.\n- Warn before irreversible or consequential actions.\n- Keep every instruction crisp and practical.`;
-  return validatePlan(await requestStructured(apiKey, model, prompt, imageData, tutorPlanSchema, 1200));
+  const prompt = `You are ScreenProf, a careful desktop software tutor.\n\nUser request: ${question}\nVisible source: ${capture.sourceName}${revisionContext}\n\nFirst identify the request type, then shape the response for that use case:\n- guide: The user wants to perform or complete a task. Return the complete ordered procedure in steps and normally leave sections empty.\n- explanation: The user wants to understand what, why, or how something works without performing a task. Set steps to an empty array and return 1 to 6 readable sections with useful supporting points.\n- troubleshooting: The user wants to diagnose or fix a problem. Use sections for visible evidence and likely causes, then return ordered diagnostic or corrective steps.\n\nRules:\n- Set responseType to exactly guide, explanation, or troubleshooting.\n- For guide and troubleshooting responses, return every necessary action now, up to 12 concise steps. Do not make the user wait for a separate AI request after every step.\n- Each step must contain exactly one user action.\n- Only claim a control or condition is currently visible when supported by the screenshot.\n- Coordinates use the screenshot itself, normalized from 0 to 1000.\n- Supply target coordinates only for a control visible on this screenshot; use null for controls that appear on later screens.\n- Explanations must be informative prose, not artificial action steps, and must use an empty steps array.\n- If an actionable goal is already complete, set completed true.\n- If a step is uncertain, say what the user should look for and use a null target instead of inventing UI.\n- Do not request or expose passwords, financial data, authentication codes, API keys, or other secrets.\n- Warn before irreversible or consequential actions.\n- Keep all content crisp, practical, and tailored to the classified request type.`;
+  return validatePlan(await requestStructured(apiKey, prompt, imageData, tutorPlanSchema));
 }
 
 async function explainGemini(question: string, step: TutorStep, capture: CaptureResult, ancestry: string[] = [], issue?: string): Promise<NestedExplanation> {
   const apiKey = getApiKey();
   if (!apiKey) throw new Error('ScreenProf is not configured for live screen guidance.');
-  const model = getSettings().model.replace(/[^a-zA-Z0-9._-]/g, '');
   const imageData = capture.dataUrl.split(',')[1];
   const ancestryContext = ancestry.length ? `\nParent path: ${ancestry.map((item) => String(item).slice(0, 300)).join(' > ')}` : '';
   const issueContext = issue ? `\nThe user reported this problem with the selected step: ${String(issue).slice(0, 1000)}` : '';
   const prompt = `You are ScreenProf. The user wants a clearer inline mini-guide for one step in an existing desktop tutorial.\n\nOverall goal: ${question}\nApplication or screen: ${capture.sourceName}${ancestryContext}\nSelected step: ${step.instruction}\nExisting detail: ${step.detail}${issueContext}\n\nExplain only this selected step as 2 to 6 tiny, ordered steps. Every returned step must contain exactly one user action and use the same full step shape as a main tutorial step, including a concise detail and success cue. The returned steps may themselves be expanded later, so make each one independently understandable. Supply target coordinates only for controls visibly supported by this screenshot; otherwise use null. Do not repeat the whole tutorial, branch to another task, or include actions that belong after the selected parent step. Use plain, concise language.`;
-  return validateExplanation(await requestStructured(apiKey, model, prompt, imageData, nestedExplanationSchema, 1800));
+  return validateExplanation(await requestStructured(apiKey, prompt, imageData, nestedExplanationSchema));
 }
 
 function saveConversation(question: string, plan: TutorPlan, capture: CaptureResult, sessionId?: string, issue?: string) {
@@ -540,11 +634,10 @@ function registerIpc() {
     const capture = await captureSource(sourceId);
     return explainGemini(question, step, capture, ancestry, issue);
   });
-  secureHandle('settings:update', (_event, update: { visionPaused?: boolean; historyEnabled?: boolean; model?: string }) => {
+  secureHandle('settings:update', (_event, update: { visionPaused?: boolean; historyEnabled?: boolean }) => {
     const settings = getSettings();
     if (typeof update.visionPaused === 'boolean') settings.visionPaused = update.visionPaused;
     if (typeof update.historyEnabled === 'boolean') settings.historyEnabled = update.historyEnabled;
-    if (typeof update.model === 'string' && /^[a-zA-Z0-9._-]{2,80}$/.test(update.model)) settings.model = update.model;
     writeJson('settings.json', settings);
     mainWindow?.webContents.send('settings:changed', publicSettings());
     return publicSettings();

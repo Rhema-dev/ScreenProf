@@ -19,9 +19,19 @@ export interface TutorStep {
   clarification: string | null;
 }
 
+export type ResponseType = 'guide' | 'explanation' | 'troubleshooting';
+
+export interface ResponseSection {
+  title: string;
+  content: string;
+  points: string[];
+}
+
 export interface TutorPlan {
+  responseType: ResponseType;
   title: string;
   summary: string;
+  sections: ResponseSection[];
   steps: TutorStep[];
   confidence: number;
   completed: boolean;
@@ -44,7 +54,6 @@ export interface CaptureResult {
 export interface StoredSettings {
   visionPaused: boolean;
   historyEnabled: boolean;
-  model: string;
 }
 
 export interface SessionMessage {
