@@ -17,7 +17,7 @@ ScreenProf is a privacy-first Windows desktop AI tutor. It captures a screen or 
 - Fully recursive “Explain further” threads whose micro-steps can be completed, highlighted, reported, and expanded again without leaving the main guide
 - Persistent New session control that safely resets the workspace while retaining previous guides in History
 - Transparent, click-through overlay window
-- Gemini API requests isolated to the Electron main process
+- Gemini API requests proxied through an authenticated Supabase Edge Function
 - Local conversation history and instant vision pause
 - Browser preview mode and coordinate-safety unit tests
 - Windows installer configuration
@@ -31,7 +31,16 @@ npm install
 npm run dev
 ```
 
-The packaged application uses the developer-configured Gemini API key. Users cannot view or replace it in Settings.
+The packaged application calls the `gemini-tutor` Supabase Edge Function. The Gemini API key is stored only as the Edge Function secret `GEMINI_API_KEY`; it is never bundled with the desktop application. Users sign in with Supabase Auth, and credentials are encrypted locally with the operating system's secure storage.
+
+Deploy backend changes with:
+
+```powershell
+npx supabase db push
+npx supabase functions deploy gemini-tutor --use-api
+```
+
+The backend limits each user to 30 tutor requests per hour and the project to 200 requests per hour.
 
 To review the UI without Electron or a key:
 
@@ -59,4 +68,4 @@ Build output is written to `release/`.
 
 ## Privacy model
 
-Screenshots are held in memory only and are not written to disk. Conversation history can be disabled or cleared. Capture is visible, user-triggered, and can be paused from the app or tray. Renderer sandboxing, context isolation, restrictive navigation, sender-validated IPC, and denied renderer permission requests form the desktop security boundary.
+Screenshots are held in memory only and are not written to disk. On each tutor request, the selected screenshot passes through the Supabase Edge Function to Gemini with `store: false`; application code does not persist the image. Conversation history is stored locally in an account-scoped file and can be disabled or cleared. Capture is visible, user-triggered, and can be paused from the app or tray. Renderer sandboxing, context isolation, restrictive navigation, sender-validated IPC, and denied renderer permission requests form the desktop security boundary.

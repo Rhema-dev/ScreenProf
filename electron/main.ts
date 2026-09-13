@@ -6,6 +6,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  safeStorage,
   screen,
   session,
   Tray,
@@ -15,6 +16,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import type {
   CaptureResult,
+  AuthState,
   NestedExplanation,
   ResponseSection,
   ResponseType,
@@ -25,7 +27,7 @@ import type {
   TutorSession,
   TutorStep,
 } from './types';
-import { clampTarget, extractInteractionText, normalizedToPixels, rateLimitCooldownMs } from './tutor-utils';
+import { clampTarget, normalizedToPixels } from './tutor-utils';
 
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 let mainWindow: BrowserWindow | null = null;
@@ -38,10 +40,23 @@ let lastCapture: CaptureResult | null = null;
 const ORB_SIZE = 76;
 const PANEL_WIDTH = 440;
 const PANEL_HEIGHT = 780;
-const BUNDLED_GEMINI_API_KEY = "AQ.Ab8RN6IRJNQbePmioaa9KCmhErCZpDE8kEnhi6b6fbPmMgXrag";
-const PRIMARY_GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').replace(/[^a-zA-Z0-9._-]/g, '') || 'gemini-3.8-flash';
-const GEMINI_MODELS = [...new Set([PRIMARY_GEMINI_MODEL, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'])];
-const modelCooldowns = new Map<string, number>();
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wbruqwwdflojipkarhcp.supabase.co';
+const SUPABASE_FUNCTION_URL = process.env.SUPABASE_FUNCTION_URL
+  || `${SUPABASE_URL}/functions/v1/gemini-tutor`;
+// Supabase publishable keys are intentionally safe to distribute in clients.
+// Access to data and functions is still controlled by RLS and user authentication.
+const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY
+  || 'sb_publishable_ZeT-yErjnHyZgzghdgW5lg_vV3iq1yj';
+
+interface StoredAuthSession {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  email: string | null;
+  userId: string;
+}
+
+let refreshInFlight: Promise<StoredAuthSession> | null = null;
 
 const defaultSettings: StoredSettings = {
   visionPaused: false,
@@ -65,6 +80,178 @@ function writeJson(file: string, value: unknown) {
   fs.writeFileSync(dataPath(file), JSON.stringify(value, null, 2), 'utf8');
 }
 
+function readAuthSession(): StoredAuthSession | null {
+  try {
+    if (!safeStorage.isEncryptionAvailable()) return null;
+    const decrypted = safeStorage.decryptString(fs.readFileSync(dataPath('auth-session.bin')));
+    const value = JSON.parse(decrypted) as Partial<StoredAuthSession>;
+    if (!value.accessToken || !value.refreshToken || !Number.isFinite(value.expiresAt)) return null;
+    const userId = value.userId || userIdFromAccessToken(value.accessToken);
+    if (!userId) return null;
+    return {
+      accessToken: value.accessToken,
+      refreshToken: value.refreshToken,
+      expiresAt: Number(value.expiresAt),
+      email: value.email == null ? null : String(value.email),
+      userId,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function userIdFromAccessToken(accessToken: string) {
+  try {
+    const payload = JSON.parse(Buffer.from(accessToken.split('.')[1], 'base64url').toString('utf8'));
+    return typeof payload?.sub === 'string' ? payload.sub.slice(0, 128) : '';
+  } catch {
+    return '';
+  }
+}
+
+function sessionFile() {
+  const userId = readAuthSession()?.userId;
+  if (!userId) return null;
+  const accountHash = crypto.createHash('sha256').update(userId).digest('hex').slice(0, 24);
+  return `sessions-${accountHash}.json`;
+}
+
+function readSessions() {
+  const file = sessionFile();
+  return file ? readJson<TutorSession[]>(file, []) : [];
+}
+
+function writeSessions(sessions: TutorSession[]) {
+  const file = sessionFile();
+  if (!file) throw new Error('Sign in before changing conversation history.');
+  writeJson(file, sessions);
+}
+
+function writeAuthSession(session: StoredAuthSession) {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('Secure credential storage is unavailable on this computer.');
+  }
+  fs.mkdirSync(app.getPath('userData'), { recursive: true });
+  fs.writeFileSync(dataPath('auth-session.bin'), safeStorage.encryptString(JSON.stringify(session)));
+}
+
+function clearAuthSession() {
+  try {
+    fs.unlinkSync(dataPath('auth-session.bin'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
+
+function publicAuthState(session = readAuthSession()): AuthState {
+  return {
+    signedIn: Boolean(session),
+    email: session?.email || null,
+  };
+}
+
+async function supabaseAuthRequest(pathname: string, body: Record<string, unknown>) {
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/${pathname}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: SUPABASE_PUBLISHABLE_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+  const raw = await response.text();
+  let result: any = {};
+  try { result = JSON.parse(raw); } catch { /* use the status error */ }
+  if (!response.ok) {
+    throw new Error(String(result?.msg || result?.message || result?.error_description || `Sign-in failed (${response.status}).`).slice(0, 500));
+  }
+  return result;
+}
+
+function sessionFromAuthResponse(result: any, fallbackUserId = ''): StoredAuthSession | null {
+  if (!result?.access_token || !result?.refresh_token) return null;
+  const userId = typeof result.user?.id === 'string'
+    ? result.user.id
+    : userIdFromAccessToken(String(result.access_token)) || fallbackUserId;
+  if (!userId) return null;
+  return {
+    accessToken: String(result.access_token),
+    refreshToken: String(result.refresh_token),
+    expiresAt: Number(result.expires_at) || Math.floor(Date.now() / 1000) + Number(result.expires_in || 3600),
+    email: result.user?.email == null ? null : String(result.user.email),
+    userId,
+  };
+}
+
+async function signIn(email: string, password: string): Promise<AuthState> {
+  const result = await supabaseAuthRequest('token?grant_type=password', { email, password });
+  const session = sessionFromAuthResponse(result);
+  if (!session) throw new Error('Supabase did not return a valid sign-in session.');
+  writeAuthSession(session);
+  return publicAuthState(session);
+}
+
+async function signUp(email: string, password: string): Promise<AuthState> {
+  const result = await supabaseAuthRequest('signup', { email, password });
+  const session = sessionFromAuthResponse(result);
+  if (session) {
+    writeAuthSession(session);
+    return publicAuthState(session);
+  }
+  return {
+    signedIn: false,
+    email,
+    message: 'Check your email to confirm your account, then sign in.',
+  };
+}
+
+async function refreshAuthSession(session: StoredAuthSession): Promise<StoredAuthSession> {
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    try {
+      const result = await supabaseAuthRequest('token?grant_type=refresh_token', {
+        refresh_token: session.refreshToken,
+      });
+      const refreshed = sessionFromAuthResponse(result, session.userId);
+      if (!refreshed) throw new Error('Supabase did not return a valid refreshed session.');
+      writeAuthSession(refreshed);
+      return refreshed;
+    } catch (error) {
+      clearAuthSession();
+      throw error;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+  return refreshInFlight;
+}
+
+async function getAccessToken() {
+  const session = readAuthSession();
+  if (!session) throw new Error('Sign in from Settings to use the AI tutor.');
+  if (session.expiresAt > Math.floor(Date.now() / 1000) + 60) return session.accessToken;
+  return (await refreshAuthSession(session)).accessToken;
+}
+
+async function signOut(): Promise<AuthState> {
+  const session = readAuthSession();
+  if (session) {
+    try {
+      await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_PUBLISHABLE_KEY,
+          Authorization: `Bearer ${session.accessToken}`,
+        },
+      });
+    } catch {
+      // Local sign-out must still succeed if the network is unavailable.
+    }
+  }
+  clearAuthSession();
+  return publicAuthState(null);
+}
+
 function getSettings(): StoredSettings {
   const stored = readJson<Partial<StoredSettings>>('settings.json', defaultSettings);
   return {
@@ -79,10 +266,6 @@ function publicSettings() {
     visionPaused: settings.visionPaused,
     historyEnabled: settings.historyEnabled,
   };
-}
-
-function getApiKey() {
-  return BUNDLED_GEMINI_API_KEY;
 }
 
 function isAllowedSender(event: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent) {
@@ -450,122 +633,73 @@ function validateExplanation(value: any): NestedExplanation {
   };
 }
 
-async function requestStructured(apiKey: string, prompt: string, imageData: string, schema: unknown) {
-  let sawRateLimit = false;
-  for (const model of GEMINI_MODELS) {
-    if ((modelCooldowns.get(model) || 0) > Date.now()) {
-      sawRateLimit = true;
-      continue;
+async function requestTutorService(body: Record<string, unknown>) {
+  const accessToken = await getAccessToken();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 100_000);
+  try {
+    const response = await fetch(SUPABASE_FUNCTION_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: SUPABASE_PUBLISHABLE_KEY,
+        Authorization: `Bearer ${accessToken}`,
+      },
+      signal: controller.signal,
+      body: JSON.stringify(body),
+    });
+    const raw = await response.text();
+    let result: any;
+    try {
+      result = JSON.parse(raw);
+    } catch {
+      throw new Error(response.ok
+        ? 'The tutor service returned an invalid response.'
+        : `The tutor service failed (${response.status}).`);
     }
-
-    let rateLimited = false;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 90_000);
-      try {
-        const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-          signal: controller.signal,
-          body: JSON.stringify({
-            model,
-            store: false,
-            input: [
-              { type: 'text', text: prompt },
-              { type: 'image', mime_type: 'image/jpeg', data: imageData },
-            ],
-            generation_config: {
-              thinking_level: 'high',
-            },
-            response_format: {
-              type: 'text',
-              mime_type: 'application/json',
-              schema,
-            },
-          }),
-        });
-        if (!response.ok) {
-          const raw = await response.text();
-          if (response.status === 429) {
-            modelCooldowns.set(model, Date.now() + rateLimitCooldownMs(response.headers.get('retry-after'), raw));
-            sawRateLimit = true;
-            rateLimited = true;
-            break;
-          }
-          let message = `Gemini request failed (${response.status}).`;
-          try { message = JSON.parse(raw)?.error?.message || message; } catch { /* keep safe message */ }
-          if (attempt === 0 && response.status >= 500) {
-            await new Promise((resolve) => setTimeout(resolve, 900));
-            continue;
-          }
-          throw new Error(message.slice(0, 500));
-        }
-        modelCooldowns.delete(model);
-        const json = await response.json() as any;
-        if (json?.status === 'incomplete') {
-          if (attempt === 0) {
-            await new Promise((resolve) => setTimeout(resolve, 900));
-            continue;
-          }
-          throw new Error('Gemini stopped before finishing the tutorial. Please try again.');
-        }
-        if (json?.status === 'failed' || json?.status === 'cancelled') {
-          throw new Error('Gemini could not complete the tutorial request. Please try again.');
-        }
-        const text = extractInteractionText(json);
-        if (!text) throw new Error('Gemini returned an empty response.');
-        try {
-          return JSON.parse(text);
-        } catch (error) {
-          if (attempt === 0 && error instanceof SyntaxError) {
-            await new Promise((resolve) => setTimeout(resolve, 900));
-            continue;
-          }
-          throw new Error('Gemini returned incomplete structured data. Please try again.');
-        }
-      } catch (error) {
-        if ((error as Error).name === 'AbortError') {
-          throw new Error('Gemini did not respond within 90 seconds. Check your connection or try a smaller window capture.');
-        }
-        if (attempt === 0 && error instanceof TypeError) {
-          await new Promise((resolve) => setTimeout(resolve, 900));
-          continue;
-        }
-        throw error;
-      } finally {
-        clearTimeout(timeout);
-      }
+    if (!response.ok) {
+      throw new Error(String(result?.error || `The tutor service failed (${response.status}).`).slice(0, 500));
     }
-    if (rateLimited) continue;
+    return result;
+  } catch (error) {
+    if ((error as Error).name === 'AbortError') {
+      throw new Error('The tutor service did not respond within 100 seconds. Check your connection and try again.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-  if (sawRateLimit) throw new Error('Gemini is busy right now. Please try again shortly.');
-  throw new Error('Unable to reach Gemini after two attempts.');
 }
 
 async function askGemini(question: string, capture: CaptureResult, previousPlan?: TutorPlan, issue?: string, currentStepIndex?: number): Promise<TutorPlan> {
-  const apiKey = getApiKey();
-  if (!apiKey) throw new Error('ScreenProf is not configured for live screen guidance.');
   const imageData = capture.dataUrl.split(',')[1];
-  const revisionContext = previousPlan
-    ? `\nExisting plan: ${JSON.stringify(previousPlan)}\nThe user reported a problem at step ${(currentStepIndex ?? 0) + 1}: ${String(issue || 'The step did not work').slice(0, 1000)}\nRewrite the complete plan to fit the newly visible screen. Preserve already completed steps at the beginning and revise the current and remaining steps.`
-    : '';
-  const prompt = `You are ScreenProf, a careful desktop software tutor.\n\nUser request: ${question}\nVisible source: ${capture.sourceName}${revisionContext}\n\nFirst identify the request type, then shape the response for that use case:\n- guide: The user wants to perform or complete a task. Return the complete ordered procedure in steps and normally leave sections empty.\n- explanation: The user wants to understand what, why, or how something works without performing a task. Set steps to an empty array and return 1 to 6 readable sections with useful supporting points.\n- troubleshooting: The user wants to diagnose or fix a problem. Use sections for visible evidence and likely causes, then return ordered diagnostic or corrective steps.\n\nRules:\n- Set responseType to exactly guide, explanation, or troubleshooting.\n- For guide and troubleshooting responses, return every necessary action now, up to 12 concise steps. Do not make the user wait for a separate AI request after every step.\n- Each step must contain exactly one user action.\n- Only claim a control or condition is currently visible when supported by the screenshot.\n- Coordinates use the screenshot itself, normalized from 0 to 1000.\n- Supply target coordinates only for a control visible on this screenshot; use null for controls that appear on later screens.\n- Explanations must be informative prose, not artificial action steps, and must use an empty steps array.\n- If an actionable goal is already complete, set completed true.\n- If a step is uncertain, say what the user should look for and use a null target instead of inventing UI.\n- Do not request or expose passwords, financial data, authentication codes, API keys, or other secrets.\n- Warn before irreversible or consequential actions.\n- Keep all content crisp, practical, and tailored to the classified request type.`;
-  return validatePlan(await requestStructured(apiKey, prompt, imageData, tutorPlanSchema));
+  return validatePlan(await requestTutorService({
+    operation: 'ask',
+    question,
+    sourceName: capture.sourceName,
+    imageData,
+    previousPlan,
+    issue,
+    currentStepIndex,
+  }));
 }
 
 async function explainGemini(question: string, step: TutorStep, capture: CaptureResult, ancestry: string[] = [], issue?: string): Promise<NestedExplanation> {
-  const apiKey = getApiKey();
-  if (!apiKey) throw new Error('ScreenProf is not configured for live screen guidance.');
   const imageData = capture.dataUrl.split(',')[1];
-  const ancestryContext = ancestry.length ? `\nParent path: ${ancestry.map((item) => String(item).slice(0, 300)).join(' > ')}` : '';
-  const issueContext = issue ? `\nThe user reported this problem with the selected step: ${String(issue).slice(0, 1000)}` : '';
-  const prompt = `You are ScreenProf. The user wants a clearer inline mini-guide for one step in an existing desktop tutorial.\n\nOverall goal: ${question}\nApplication or screen: ${capture.sourceName}${ancestryContext}\nSelected step: ${step.instruction}\nExisting detail: ${step.detail}${issueContext}\n\nExplain only this selected step as 2 to 6 tiny, ordered steps. Every returned step must contain exactly one user action and use the same full step shape as a main tutorial step, including a concise detail and success cue. The returned steps may themselves be expanded later, so make each one independently understandable. Supply target coordinates only for controls visibly supported by this screenshot; otherwise use null. Do not repeat the whole tutorial, branch to another task, or include actions that belong after the selected parent step. Use plain, concise language.`;
-  return validateExplanation(await requestStructured(apiKey, prompt, imageData, nestedExplanationSchema));
+  return validateExplanation(await requestTutorService({
+    operation: 'explain',
+    question,
+    sourceName: capture.sourceName,
+    imageData,
+    step,
+    ancestry,
+    issue,
+  }));
 }
 
 function saveConversation(question: string, plan: TutorPlan, capture: CaptureResult, sessionId?: string, issue?: string) {
   if (!getSettings().historyEnabled) return null;
-  const sessions = readJson<TutorSession[]>('sessions.json', []);
+  const sessions = readSessions();
   const now = new Date().toISOString();
   let current = sessions.find((item) => item.id === sessionId);
   if (!current) {
@@ -585,7 +719,7 @@ function saveConversation(question: string, plan: TutorPlan, capture: CaptureRes
   ];
   current.messages.push(...messages);
   current.updatedAt = now;
-  writeJson('sessions.json', sessions.slice(0, 50));
+  writeSessions(sessions.slice(0, 50));
   return current.id;
 }
 
@@ -607,12 +741,26 @@ function showOverlay(step: TutorStep, displayId?: string) {
 function registerIpc() {
   secureHandle('app:bootstrap', async () => ({
     settings: publicSettings(),
-    sessions: readJson<TutorSession[]>('sessions.json', []),
+    auth: publicAuthState(),
+    sessions: readSessions(),
     platform: process.platform,
     collapsed,
   }));
   secureHandle('sources:list', () => listSources());
   secureHandle('screen:capture', (_event, sourceId: string) => captureSource(sourceId));
+  secureHandle('auth:sign-in', (_event, payload: { email?: string; password?: string }) => {
+    const email = String(payload?.email || '').trim().toLowerCase().slice(0, 320);
+    const password = String(payload?.password || '');
+    if (!email || !password) throw new Error('Enter your email and password.');
+    return signIn(email, password);
+  });
+  secureHandle('auth:sign-up', (_event, payload: { email?: string; password?: string }) => {
+    const email = String(payload?.email || '').trim().toLowerCase().slice(0, 320);
+    const password = String(payload?.password || '');
+    if (!email || password.length < 8) throw new Error('Enter an email and a password of at least 8 characters.');
+    return signUp(email, password);
+  });
+  secureHandle('auth:sign-out', () => signOut());
   secureHandle('tutor:ask', async (_event, payload: { question: string; sourceId: string; sessionId?: string; previousPlan?: TutorPlan; issue?: string; currentStepIndex?: number }) => {
     const question = String(payload?.question || '').trim().slice(0, 2000);
     if (!question) throw new Error('Tell ScreenProf what you want to do.');
@@ -620,7 +768,7 @@ function registerIpc() {
     const plan = await askGemini(question, capture, payload.previousPlan, payload.issue, payload.currentStepIndex);
     const sessionId = saveConversation(question, plan, capture, payload.sessionId, payload.issue);
     if (plan.steps[0]?.target) showOverlay(plan.steps[0], capture.displayId);
-    return { plan, sessionId, capture, sessions: readJson<TutorSession[]>('sessions.json', []) };
+    return { plan, sessionId, capture, sessions: readSessions() };
   });
   secureHandle('tutor:explain', async (_event, payload: { question: string; sourceId: string; step: TutorStep; ancestry?: string[]; issue?: string }) => {
     const question = String(payload?.question || '').trim().slice(0, 2000);
@@ -642,7 +790,7 @@ function registerIpc() {
     mainWindow?.webContents.send('settings:changed', publicSettings());
     return publicSettings();
   });
-  secureHandle('history:clear', () => { writeJson('sessions.json', []); return []; });
+  secureHandle('history:clear', () => { writeSessions([]); return []; });
   secureHandle('overlay:hide', () => overlayWindow?.hide());
   secureHandle('overlay:show', (_event, step: TutorStep) => showOverlay(validateStep(step), lastCapture?.displayId));
   secureHandle('window:minimize', () => mainWindow?.minimize());

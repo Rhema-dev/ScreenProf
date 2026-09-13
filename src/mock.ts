@@ -3,6 +3,7 @@ import type { BootstrapData, CaptureSource, TutorPlan, TutorStep } from './types
 export const mockBootstrap: BootstrapData = {
   platform: 'browser-preview',
   settings: { visionPaused: false, historyEnabled: true },
+  auth: { signedIn: true, email: 'preview@screenprof.app' },
   sessions: [],
 };
 

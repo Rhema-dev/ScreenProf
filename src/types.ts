@@ -49,6 +49,11 @@ export interface PublicSettings {
   visionPaused: boolean;
   historyEnabled: boolean;
 }
+export interface AuthState {
+  signedIn: boolean;
+  email: string | null;
+  message?: string;
+}
 export interface SessionMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -67,6 +72,7 @@ export interface TutorSession {
 }
 export interface BootstrapData {
   settings: PublicSettings;
+  auth: AuthState;
   sessions: TutorSession[];
   platform: string;
   collapsed?: boolean;
@@ -76,6 +82,9 @@ export interface ScreenProfBridge {
   bootstrap(): Promise<BootstrapData>;
   listSources(): Promise<CaptureSource[]>;
   capture(sourceId: string): Promise<CaptureResult>;
+  signIn(payload: { email: string; password: string }): Promise<AuthState>;
+  signUp(payload: { email: string; password: string }): Promise<AuthState>;
+  signOut(): Promise<AuthState>;
   askTutor(payload: { question: string; sourceId: string; sessionId?: string; previousPlan?: TutorPlan; issue?: string; currentStepIndex?: number }): Promise<{ plan: TutorPlan; sessionId: string | null; capture: CaptureResult; sessions: TutorSession[] }>;
   explainStep(payload: { question: string; sourceId: string; step: TutorStep; ancestry?: string[]; issue?: string }): Promise<NestedExplanation>;
   updateSettings(update: { visionPaused?: boolean; historyEnabled?: boolean }): Promise<PublicSettings>;

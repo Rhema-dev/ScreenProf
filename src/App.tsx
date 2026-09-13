@@ -10,6 +10,8 @@ import {
   History,
   LayoutGrid,
   LoaderCircle,
+  LogIn,
+  LogOut,
   MessageCircleQuestion,
   Monitor,
   MousePointer2,
@@ -29,6 +31,7 @@ import {
 import { BrandMark, EmptyState, Toggle, WindowBar } from "./components";
 import { mockBootstrap, mockPlan, mockSources } from "./mock";
 import type {
+  AuthState,
   BootstrapData,
   CaptureResult,
   CaptureSource,
@@ -42,6 +45,13 @@ import type {
 
 type View = "assistant" | "history" | "settings";
 type Phase = "idle" | "thinking" | "step" | "error";
+type TutorRequest = {
+  question: string;
+  previousPlan?: TutorPlan;
+  sourceId: string;
+  issue?: string;
+  issueStepIndex?: number;
+};
 
 const starterPrompts = [
   {
@@ -730,14 +740,115 @@ function HistoryView({
   );
 }
 
+function AuthView({
+  initialError,
+  onSignIn,
+  onSignUp,
+}: {
+  initialError?: string;
+  onSignIn: (email: string, password: string) => Promise<AuthState>;
+  onSignUp: (email: string, password: string) => Promise<AuthState>;
+}) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busyMode, setBusyMode] = useState<"sign-in" | "sign-up" | null>(null);
+  const [authError, setAuthError] = useState(initialError || "");
+  const [authMessage, setAuthMessage] = useState("");
+
+  const submit = async (mode: "sign-in" | "sign-up") => {
+    if (!email.trim() || !password) return;
+    setBusyMode(mode);
+    setAuthError("");
+    setAuthMessage("");
+    try {
+      const action = mode === "sign-in" ? onSignIn : onSignUp;
+      const result = await action(email.trim(), password);
+      if (!result.signedIn) setAuthMessage(result.message || "Check your email, then sign in.");
+    } catch (error) {
+      setAuthError(friendlyError(error));
+    } finally {
+      setBusyMode(null);
+    }
+  };
+
+  return (
+    <main className="auth-gate">
+      <section className="auth-card" aria-labelledby="auth-title">
+        <div className="auth-brand">
+          <span><BrandMark /></span>
+          <p className="eyebrow">Secure AI tutor</p>
+          <h1 id="auth-title">Welcome to ScreenProf</h1>
+          <p>Sign in before sharing a screen or opening your workspace.</p>
+        </div>
+        <div className="auth-fields gate-fields">
+          <label>
+            <span>Email</span>
+            <input
+              type="email"
+              autoComplete="email"
+              autoFocus
+              placeholder="you@example.com"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>Password</span>
+            <input
+              type="password"
+              autoComplete="current-password"
+              placeholder="At least 8 characters"
+              value={password}
+              minLength={8}
+              onChange={(event) => setPassword(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void submit("sign-in");
+              }}
+            />
+          </label>
+        </div>
+        {authError && <p className="auth-feedback error gate-feedback">{authError}</p>}
+        {authMessage && <p className="auth-feedback gate-feedback">{authMessage}</p>}
+        <div className="auth-gate-actions">
+          <button
+            type="button"
+            className="primary-button"
+            disabled={Boolean(busyMode) || !email.trim() || !password}
+            onClick={() => void submit("sign-in")}
+          >
+            {busyMode === "sign-in" ? <LoaderCircle className="spin" size={15} /> : <LogIn size={15} />}
+            Sign in
+          </button>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={Boolean(busyMode) || !email.trim() || password.length < 8}
+            onClick={() => void submit("sign-up")}
+          >
+            {busyMode === "sign-up" && <LoaderCircle className="spin" size={14} />}
+            Create account
+          </button>
+        </div>
+        <p className="auth-security-note">
+          <ShieldCheck size={14} /> Your Gemini API key stays in Supabase and is never sent to this app.
+        </p>
+      </section>
+    </main>
+  );
+}
+
 function SettingsView({
   settings,
+  auth,
   onSave,
   onClear,
+  onSignOut,
 }: {
   settings: PublicSettings;
+  auth: AuthState;
   onSave: (update: { historyEnabled?: boolean }) => Promise<void>;
   onClear: () => void;
+  onSignOut: () => Promise<void>;
 }) {
   return (
     <main className="page-view settings-view">
@@ -748,6 +859,18 @@ function SettingsView({
         </div>
       </div>
       <div className="settings-content">
+        <section className="settings-section auth-section">
+          <h3>ScreenProf account</h3>
+          <div className="auth-signed-in">
+            <div>
+              <strong>Signed in</strong>
+              <small>{auth.email || "Supabase user"}</small>
+            </div>
+            <button type="button" onClick={() => void onSignOut()}>
+              <LogOut size={14} /> Sign out
+            </button>
+          </div>
+        </section>
         <section className="settings-section">
           <h3>Privacy</h3>
           <div className="setting-row">
@@ -791,6 +914,7 @@ function SettingsView({
 
 export function App() {
   const [collapsed, setCollapsed] = useState(Boolean(window.screenProf));
+  const [bootReady, setBootReady] = useState(!window.screenProf);
   const [boot, setBoot] = useState<BootstrapData>(mockBootstrap);
   const [view, setView] = useState<View>("assistant");
   const [phase, setPhase] = useState<Phase>("idle");
@@ -808,6 +932,7 @@ export function App() {
   const [sessionId, setSessionId] = useState<string>();
   const [error, setError] = useState("");
   const textRef = useRef<HTMLTextAreaElement>(null);
+  const lastRequestRef = useRef<TutorRequest | null>(null);
   const selectedSource = sources.find(
     (source) => source.id === selectedSourceId,
   );
@@ -822,8 +947,13 @@ export function App() {
         .then((data) => {
           setBoot(data);
           setCollapsed(Boolean(data.collapsed));
+          setBootReady(true);
         })
-        .catch((err) => setError(friendlyError(err)));
+        .catch((err) => {
+          setError(friendlyError(err));
+          setBoot((current) => ({ ...current, auth: { signedIn: false, email: null } }));
+          setBootReady(true);
+        });
       unsubscribe = bridge.onSettingsChanged((settings) =>
         setBoot((current) => ({ ...current, settings })),
       );
@@ -864,6 +994,11 @@ export function App() {
   ) => {
     const cleanQuestion = requestedQuestion.trim();
     if (!cleanQuestion) return textRef.current?.focus();
+    if (!boot.auth.signedIn) {
+      setError("Sign in from Settings to use the AI tutor.");
+      setView("settings");
+      return;
+    }
     if (boot.settings.visionPaused) {
       setError("AI vision is paused. Resume it to ask about your screen.");
       setPhase("error");
@@ -876,6 +1011,13 @@ export function App() {
       return;
     }
     const isRevision = Boolean(previousPlan && issue);
+    lastRequestRef.current = {
+      question: cleanQuestion,
+      previousPlan,
+      sourceId,
+      issue,
+      issueStepIndex,
+    };
     setGoal(cleanQuestion);
     setQuestion("");
     setError("");
@@ -1001,7 +1143,19 @@ export function App() {
     setCompletedSteps(new Set());
     setRevising(false);
     setGoal("");
+    lastRequestRef.current = null;
     bridge?.hideOverlay();
+  };
+  const retryLastRequest = () => {
+    const request = lastRequestRef.current;
+    if (!request) return;
+    void ask(
+      request.question,
+      request.previousPlan,
+      request.sourceId,
+      request.issue,
+      request.issueStepIndex,
+    );
   };
   const updateSettings = async (update: {
     visionPaused?: boolean;
@@ -1028,6 +1182,41 @@ export function App() {
   const clearHistory = async () => {
     const sessions = bridge ? await bridge.clearHistory() : [];
     setBoot((current) => ({ ...current, sessions }));
+  };
+  const signInUser = async (email: string, password: string) => {
+    const auth = bridge
+      ? await bridge.signIn({ email, password })
+      : { signedIn: true, email };
+    if (auth.signedIn) {
+      const accountBoot = bridge ? await bridge.bootstrap() : { ...boot, auth, sessions: [] };
+      setBoot(accountBoot);
+      setError("");
+      setView("assistant");
+    } else {
+      setBoot((current) => ({ ...current, auth, sessions: [] }));
+    }
+    return auth;
+  };
+  const signUpUser = async (email: string, password: string) => {
+    const auth = bridge
+      ? await bridge.signUp({ email, password })
+      : { signedIn: true, email };
+    if (auth.signedIn) {
+      const accountBoot = bridge ? await bridge.bootstrap() : { ...boot, auth, sessions: [] };
+      setBoot(accountBoot);
+      setError("");
+      setView("assistant");
+    } else {
+      setBoot((current) => ({ ...current, auth, sessions: [] }));
+    }
+    return auth;
+  };
+  const signOutUser = async () => {
+    const auth = bridge
+      ? await bridge.signOut()
+      : { signedIn: false, email: null };
+    setBoot((current) => ({ ...current, auth, sessions: [] }));
+    resetGuide();
   };
   const resumeSession = (session: TutorSession) => {
     const lastMessage = [...session.messages]
@@ -1088,6 +1277,41 @@ export function App() {
           <BrandMark />
         </button>
         <span className="orb-status" />
+      </div>
+    );
+  }
+
+  if (!bootReady) {
+    return (
+      <div className="app-shell auth-shell">
+        <WindowBar
+          onCollapse={() => {
+            setCollapsed(true);
+            void bridge?.collapse();
+          }}
+        />
+        <main className="auth-gate auth-loading">
+          <LoaderCircle className="spin" size={24} />
+          <span>Checking your secure session...</span>
+        </main>
+      </div>
+    );
+  }
+
+  if (!boot.auth.signedIn) {
+    return (
+      <div className="app-shell auth-shell">
+        <WindowBar
+          onCollapse={() => {
+            setCollapsed(true);
+            void bridge?.collapse();
+          }}
+        />
+        <AuthView
+          initialError={error}
+          onSignIn={signInUser}
+          onSignUp={signUpUser}
+        />
       </div>
     );
   }
@@ -1204,10 +1428,7 @@ export function App() {
                 action={
                   <button
                     className="secondary-button"
-                    onClick={() => {
-                      setPhase("idle");
-                      setError("");
-                    }}
+                    onClick={retryLastRequest}
                   >
                     Try again
                   </button>
@@ -1226,8 +1447,10 @@ export function App() {
         {view === "settings" && (
           <SettingsView
             settings={boot.settings}
+            auth={boot.auth}
             onSave={updateSettings}
             onClear={() => void clearHistory()}
+            onSignOut={signOutUser}
           />
         )}
 
@@ -1254,12 +1477,12 @@ export function App() {
                     ? "Ask a follow-up…"
                     : "Ask about your screen…"
                 }
-                disabled={boot.settings.visionPaused}
+                disabled={boot.settings.visionPaused || !boot.auth.signedIn}
               />
               <button
                 className="send-button"
                 onClick={() => void ask()}
-                disabled={!question.trim() || boot.settings.visionPaused}
+                disabled={!question.trim() || boot.settings.visionPaused || !boot.auth.signedIn}
                 aria-label="Send"
               >
                 <Send size={17} />

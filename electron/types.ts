@@ -56,6 +56,12 @@ export interface StoredSettings {
   historyEnabled: boolean;
 }
 
+export interface AuthState {
+  signedIn: boolean;
+  email: string | null;
+  message?: string;
+}
+
 export interface SessionMessage {
   id: string;
   role: 'user' | 'assistant';
