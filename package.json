@@ -11,7 +11,8 @@
     "start": "electron .",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.electron.json --noEmit",
     "test": "vitest run",
-    "package:win": "npm run build && electron-builder --win nsis"
+    "package:win": "npm run build && electron-builder --win nsis",
+    "package:mac": "npm run build && electron-builder --mac dmg zip --universal"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
@@ -48,6 +49,15 @@
     "win": {
       "icon": "public/screenprof-icon.png",
       "target": "nsis"
+    },
+    "mac": {
+      "icon": "public/screenprof-icon.png",
+      "category": "public.app-category.education",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}"
     },
     "nsis": {
       "oneClick": false,

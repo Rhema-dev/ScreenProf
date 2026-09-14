@@ -805,7 +805,12 @@ app.whenReady().then(() => {
   createMainWindow();
   createOverlayWindow();
   createTray();
-  globalShortcut.register('CommandOrControl+Space', showMainWindow);
+  // Command+Space is reserved by Spotlight on macOS, so use a modifier that
+  // remains available while preserving the existing Windows shortcut.
+  const assistantShortcut = process.platform === 'darwin'
+    ? 'CommandOrControl+Shift+Space'
+    : 'CommandOrControl+Space';
+  globalShortcut.register(assistantShortcut, showMainWindow);
   app.on('activate', () => {
     if (!mainWindow) createMainWindow();
     showMainWindow();

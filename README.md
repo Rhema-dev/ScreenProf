@@ -1,13 +1,13 @@
 # ScreenProf
 
-ScreenProf is a privacy-first Windows desktop AI tutor. It captures a screen or window only when the user asks a question, sends that single image to Gemini, and guides the user through the visible interface one step at a time with a click-through highlight overlay.
+ScreenProf is a privacy-first Windows and macOS desktop AI tutor. It captures a screen or window only when the user asks a question, sends that single image to Gemini, and guides the user through the visible interface one step at a time with a click-through highlight overlay.
 
 ## What is included
 
 - Floating, always-on-top Electron assistant
 - Draggable floating logo that expands into the assistant and collapses back in one click
 - Secure, sandboxed React renderer with a narrow preload API
-- Global `Ctrl + Space` shortcut and system tray controls
+- Global `Ctrl + Space` shortcut on Windows or `Cmd + Shift + Space` on macOS, plus system tray controls
 - Explicit screen/window source selection
 - Event-driven screen capture (no continuous recording)
 - Reduced capture payloads, high Gemini thinking, transient retry handling, and a 90-second network deadline
@@ -20,7 +20,7 @@ ScreenProf is a privacy-first Windows desktop AI tutor. It captures a screen or 
 - Gemini API requests proxied through an authenticated Supabase Edge Function
 - Local conversation history and instant vision pause
 - Browser preview mode and coordinate-safety unit tests
-- Windows installer configuration
+- Windows and universal macOS release configuration
 
 Autonomous mouse/keyboard control is intentionally not part of this MVP.
 
@@ -62,6 +62,12 @@ Create a Windows installer with:
 
 ```powershell
 npm run package:win
+```
+
+Create a universal macOS DMG and ZIP on macOS with:
+
+```bash
+npm run package:mac
 ```
 
 Build output is written to `release/`.
